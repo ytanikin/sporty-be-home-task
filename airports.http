@@ -1,0 +1,21 @@
+### Get airport by ICAO (example EGLL)
+GET localhost:8080/api/v1/airports/EGLL
+Accept: application/json
+
+### Health
+GET localhost:8080/actuator/health
+Accept: application/json
+
+### Metrics (Prometheus format)
+GET localhost:8080/actuator/prometheus
+Accept: text/plain
+
+### Circuit Breakers status
+GET localhost:8080/actuator/circuitbreakers
+Accept: application/json
+
+### Rate Limiters status
+GET localhost:8080/actuator/ratelimiters
+Accept: application/json
+
+
