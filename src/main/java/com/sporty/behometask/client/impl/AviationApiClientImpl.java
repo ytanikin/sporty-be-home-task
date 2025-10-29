@@ -1,98 +1,94 @@
 package com.sporty.behometask.client.impl;
 
 import com.sporty.behometask.client.AviationDataClient;
-import com.sporty.behometask.client.dto.AviationApiAirportResponse;
+import com.sporty.behometask.client.strategy.EndpointStrategy;
 import com.sporty.behometask.dto.AirportResponse;
-import com.sporty.behometask.exception.AirportNotFoundException;
 import com.sporty.behometask.exception.AviationApiException;
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
-import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
-import io.github.resilience4j.retry.annotation.Retry;
+import io.github.resilience4j.bulkhead.BulkheadFullException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.HttpClientErrorException;
-import org.springframework.web.client.ResourceAccessException;
-import org.springframework.web.client.RestTemplate;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 /**
- * Implementation of AviationDataClient for Aviation Weather API. Includes resilience patterns: retry, circuit breaker, and rate limiting.
+ * Implementation of AviationDataClient using strategy pattern with multiple endpoints.
+ * Manages failover between different endpoint strategies with circuit breaker support.
+ * Each strategy has its own resilience policies (retry, circuit breaker, rate limiter).
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class AviationApiClientImpl implements AviationDataClient {
 
-    private final RestTemplate restTemplate;
-    private final String apiBaseUrl;
-
-    public AviationApiClientImpl(RestTemplate restTemplate, @Value("${aviation.api.base-url}") String apiBaseUrl) {
-        this.restTemplate = restTemplate;
-        this.apiBaseUrl = apiBaseUrl;
+    private final List<EndpointStrategy> strategies;
+    
+    private List<EndpointStrategy> getOrderedStrategies() {
+        return strategies.stream()
+                .sorted(Comparator.comparing(EndpointStrategy::getPriority))
+                .collect(Collectors.toList());
     }
-
+    
     @Override
-    @CircuitBreaker(name = "aviationApi", fallbackMethod = "getAirportFallback")
-    @Retry(name = "aviationApi")
-    @RateLimiter(name = "aviationApi")
     public AirportResponse getAirportByIcaoCode(String icaoCode) {
-        log.info("Fetching airport data for ICAO code: {}", icaoCode);
-
-        try {
-            String url = String.format("%s/airport?ids=%s&format=json", apiBaseUrl, icaoCode);
-            log.debug("Calling aviation API: {}", url);
-
-            AviationApiAirportResponse[] apiResponseArray = restTemplate.getForObject(url, AviationApiAirportResponse[].class);
-
-            if (apiResponseArray == null || apiResponseArray.length == 0) {
-                log.warn("Received empty response for ICAO code: {}", icaoCode);
-                throw new AirportNotFoundException(icaoCode);
+        List<EndpointStrategy> orderedStrategies = getOrderedStrategies();
+        AviationApiException lastException = null;
+        int circuitBreakerOpenCount = 0;
+        int totalStrategies = orderedStrategies.size();
+        
+        for (EndpointStrategy strategy : orderedStrategies) {
+            try {
+                log.debug("Attempting to fetch airport data using strategy: {} (priority: {})", strategy.getStrategyName(), strategy.getPriority());
+                AirportResponse response = strategy.getAirportByIcaoCode(icaoCode);
+                log.info("Successfully retrieved airport data using strategy: {}", strategy.getStrategyName());
+                return response;
+            } catch (com.sporty.behometask.exception.AirportNotFoundException ex) {
+                log.warn("Airport not found using strategy: {}", strategy.getStrategyName());
+                throw ex;
+            } catch (CallNotPermittedException ex) {
+                circuitBreakerOpenCount++;
+                log.warn("Circuit breaker is OPEN for strategy: {} (priority: {}). Trying next strategy.", strategy.getStrategyName(), strategy.getPriority());
+            } catch (BulkheadFullException ex) {
+                log.warn("Bulkhead is FULL for strategy: {} (priority: {}). Trying next strategy.", strategy.getStrategyName(), strategy.getPriority(), ex);
+                lastException = new AviationApiException("Strategy " + strategy.getStrategyName() + " is overloaded", ex);
+            } catch (TimeoutException ex) {
+                log.warn("Timeout occurred for strategy: {} (priority: {}). Trying next strategy.", strategy.getStrategyName(), strategy.getPriority(), ex);
+                lastException = new AviationApiException("Strategy " + strategy.getStrategyName() + " timed out", ex);
+            } catch (AviationApiException ex) {
+                log.warn("Strategy {} (priority: {}) failed: {}", strategy.getStrategyName(), strategy.getPriority(), ex.getMessage());
+                lastException = ex;
+            } catch (Exception ex) {
+                log.error("Unexpected error with strategy {} (priority: {}): {}", strategy.getStrategyName(), strategy.getPriority(), ex.getMessage(), ex);
+                lastException = new AviationApiException("Unexpected error with strategy " + strategy.getStrategyName(), ex);
             }
-
-            AviationApiAirportResponse apiResponse = apiResponseArray[0];
-            log.info("Successfully retrieved airport data for ICAO code: {}", icaoCode);
-            return mapToAirportResponse(apiResponse);
-        } catch (HttpClientErrorException.NotFound ex) {
-            log.warn("Airport not found for ICAO code: {}", icaoCode);
-            throw new AirportNotFoundException(icaoCode);
-        } catch (HttpClientErrorException ex) {
-            log.error("HTTP error calling aviation API for ICAO code: {}, status: {}", icaoCode, ex.getStatusCode(), ex);
-            throw new AviationApiException(String.format("Aviation API returned error: %s", ex.getStatusCode()), ex);
-        } catch (ResourceAccessException ex) {
-            log.error("Timeout or connection error calling aviation API for ICAO code: {}", icaoCode, ex);
-            throw new AviationApiException("Failed to connect to aviation API", ex);
-        } catch (Exception ex) {
-            log.error("Unexpected error calling aviation API for ICAO code: {}", icaoCode, ex);
-            throw new AviationApiException("Unexpected error calling aviation API", ex);
         }
+        
+        if (circuitBreakerOpenCount == totalStrategies) {
+            log.error("All circuit breakers are OPEN for ICAO code: {}. Returning fallback response.", icaoCode);
+            return createFallbackResponse(icaoCode);
+        }
+        
+        log.error("All endpoint strategies failed for ICAO code: {}", icaoCode);
+        throw new AviationApiException("All aviation data endpoints are currently unavailable", lastException);
     }
-
+    
     /**
-     * Fallback method for circuit breaker. Returns cached data or a meaningful error message.
+     * Creates a fallback response when all circuit breakers are open.
+     * 
+     * @param icaoCode the ICAO code
+     * @return fallback airport response indicating service unavailability
      */
-    private AirportResponse getAirportFallback(String icaoCode, Exception ex) {
-        log.error("Circuit breaker fallback triggered for ICAO code: {}", icaoCode, ex);
-        // In a real production system, we might return cached data here
-        throw new AviationApiException("Aviation data service is currently unavailable", ex);
-    }
-
-    /**
-     * Maps provider-specific response to our standardized airport response. This isolates the service layer from provider-specific data structures.
-     */
-    private AirportResponse mapToAirportResponse(AviationApiAirportResponse apiResponse) {
-        AirportResponse.LocationInfo location = AirportResponse.LocationInfo.builder().latitude(apiResponse.getLatitude()).longitude(apiResponse.getLongitude())
-                .build();
-
+    private AirportResponse createFallbackResponse(String icaoCode) {
         return AirportResponse.builder()
-                .icaoCode(apiResponse.getIcaoCode())
-                .iataCode(apiResponse.getIataCode())
-                .name(apiResponse.getName())
-                .city(apiResponse.getCity())
-                .country(apiResponse.getCountry())
-                .location(location)
+                .icaoCode(icaoCode)
+                .name("Service Temporarily Unavailable")
+                .city("N/A")
+                .country("N/A")
                 .timezone("UTC")
-                .elevation(apiResponse.getElevation())
                 .build();
     }
 }
-
-

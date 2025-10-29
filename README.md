@@ -18,7 +18,7 @@ A production-ready Spring Boot microservice that integrates with aviation data A
 - [Future Improvements](#future-improvements)
 
 ## Overview
-w
+
 This microservice provides a robust wrapper around aviation data APIs (specifically aviationapi.com) to fetch airport information using ICAO codes. The implementation prioritizes production readiness with emphasis on:
 
 - **Scalability**: Stateless design, clean service layering
