@@ -52,6 +52,37 @@ public AirportResponse getAirportByIcaoCode(String icaoCode) {
 - Faster incident response
 - Historical analysis
 
+**Implementation**:
+```java
+// CircuitBreakerEventListener.java - Listen to state transitions
+@Component
+@Slf4j
+public class CircuitBreakerEventListener {
+    
+    @EventListener
+    public void onStateTransition(CircuitBreakerOnStateTransitionEvent event) {
+        log.warn("Circuit breaker '{}' transitioned from {} to {}", 
+            event.getCircuitBreakerName(), 
+            event.getStateTransition().getFromState(), 
+            event.getStateTransition().getToState());
+        
+        // Emit custom metric
+        meterRegistry.counter("circuit.breaker.transitions", 
+            "name", event.getCircuitBreakerName(),
+            "from", event.getStateTransition().getFromState().name(),
+            "to", event.getStateTransition().getToState().name())
+            .increment();
+    }
+    
+    @EventListener
+    public void onFailureRateExceeded(CircuitBreakerOnFailureRateExceededEvent event) {
+        log.error("Circuit breaker '{}' failure rate exceeded: {}%", 
+            event.getCircuitBreakerName(), 
+            event.getFailureRate());
+    }
+}
+```
+
 ### 5. **Custom Health Indicators per Strategy**
 **Problem**: Generic health checks don't show individual strategy status.
 **Solution**: Create custom health indicators for each endpoint strategy.
